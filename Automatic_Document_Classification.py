@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from transformers import BertTokenizer, BertForSequenceClassification
 from transformers import TrainingArguments, Trainer
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -17,21 +16,24 @@ import pytesseract
 import mimetypes
 
 class DocumentClassifier:
-    def __init__(self, model_name='klue/bert-base', num_categories=10, use_gpu=False):
+    def __init__(self, model_name='klue/bert-base', use_gpu=False):
         """
         문서 자동 분류를 위한 머신러닝 모델
         
         Args:
             model_name (str): 사용할 사전 학습 모델 이름
-            num_categories (int): 분류 카테고리 수
             use_gpu (bool): GPU 사용 여부
         """
         self.model_name = model_name
-        self.num_categories = num_categories
         self.device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        
+        # 고정된 카테고리 목록 (시험자료, 자소서, 레포트, 이력서)
+        self.categories = ["시험자료", "자소서", "레포트", "이력서"]
+        self.num_categories = len(self.categories)
         
         # 카테고리 인코더
         self.label_encoder = LabelEncoder()
+        self.label_encoder.fit(self.categories)
         
         # 토크나이저와 모델 초기화
         self.tokenizer = None
@@ -57,7 +59,7 @@ class DocumentClassifier:
                 mime_type = 'image/jpeg'
         
         # 파일 타입에 따라 텍스트 추출
-        if mime_type.startswith('text/'):
+        if mime_type and mime_type.startswith('text/'):
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f.read()
             
@@ -69,23 +71,23 @@ class DocumentClassifier:
                     text += page.extract_text() + "\n"
             return text
             
-        elif mime_type.startswith('application/vnd.openxmlformats-officedocument.wordprocessingml') or mime_type == 'application/msword':
+        elif mime_type and (mime_type.startswith('application/vnd.openxmlformats-officedocument.wordprocessingml') or mime_type == 'application/msword'):
             doc = docx.Document(file_path)
             return "\n".join([para.text for para in doc.paragraphs])
             
-        elif mime_type.startswith('image/'):
+        elif mime_type and mime_type.startswith('image/'):
             # 이미지에서 OCR로 텍스트 추출
             img = Image.open(file_path)
-            return pytesseract.image_to_string(img)
+            return pytesseract.image_to_string(img, lang='kor+eng')  # 한국어 및 영어 OCR 지원
             
         return ""
     
     def _preprocess_text(self, text):
         """텍스트 전처리"""
-        # 소문자 변환
+        # 소문자 변환 (영어 텍스트의 경우)
         text = text.lower()
         # 특수문자 제거 (공백으로 대체)
-        text = re.sub(r'[^\w\s]', ' ', text)
+        text = re.sub(r'[^\w\s가-힣]', ' ', text)  # 한글 문자 보존
         # 여러 공백을 하나로 치환
         text = re.sub(r'\s+', ' ', text).strip()
         
@@ -119,29 +121,25 @@ class DocumentClassifier:
             max_length=512
         )
     
-    def train(self, train_data, categories=None, validation_split=0.2, epochs=3):
+    def train(self, train_data, validation_split=0.2, epochs=3):
         """모델 학습"""
         texts = []
         labels = []
         
         # 학습 데이터 준비
         for file_path, category in train_data:
+            # 카테고리가 유효한지 확인
+            if category not in self.categories:
+                raise ValueError(f"카테고리 '{category}'는 유효하지 않습니다. 유효한 카테고리: {self.categories}")
+                
             text = self._extract_text(file_path)
             text = self._preprocess_text(text)
             
             texts.append(text)
             labels.append(category)
         
-        # 카테고리 인코딩
-        if categories:
-            self.label_encoder.fit(categories)
-        else:
-            self.label_encoder.fit(labels)
-        
+        # 카테고리를 정수로 인코딩
         encoded_labels = self.label_encoder.transform(labels)
-        
-        # 이진 분류인 경우 num_labels=2, 다중 클래스 분류인 경우 클래스 수
-        self.num_categories = len(self.label_encoder.classes_)
         
         # 토크나이저와 모델 초기화
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -233,24 +231,15 @@ class DocumentClassifier:
         # 예측된 클래스 이름
         predicted_class = self.label_encoder.inverse_transform([predicted_class_idx])[0]
         
-        # 상위 3개 카테고리 및 확률 계산
-        top_3_probs, top_3_indices = torch.topk(probabilities, min(3, self.num_categories), dim=1)
-        
-        top_categories = []
-        for i in range(top_3_indices.shape[1]):
-            category_idx = top_3_indices[0, i].cpu().item()
-            probability = top_3_probs[0, i].cpu().item()
-            category_name = self.label_encoder.inverse_transform([category_idx])[0]
-            
-            top_categories.append({
-                'category': category_name,
-                'probability': probability
-            })
+        # 각 카테고리 확률
+        category_probs = {}
+        for i, cat in enumerate(self.categories):
+            category_probs[cat] = probabilities[0, i].cpu().item()
         
         return {
             'predicted_category': predicted_class,
             'confidence': prediction_probability,
-            'top_categories': top_categories
+            'category_probabilities': category_probs
         }
     
     def save_model(self, model_dir):
@@ -273,7 +262,7 @@ class DocumentClassifier:
             'model_name': self.model_name,
             'num_categories': self.num_categories,
             'is_finetuned': self.is_finetuned,
-            'classes': self.label_encoder.classes_.tolist()
+            'categories': self.categories
         }
         
         joblib.dump(config, f"{model_dir}/config.pkl")
@@ -285,6 +274,7 @@ class DocumentClassifier:
         self.model_name = config['model_name']
         self.num_categories = config['num_categories']
         self.is_finetuned = config['is_finetuned']
+        self.categories = config['categories']
         
         # 레이블 인코더 로드
         self.label_encoder = joblib.load(f"{model_dir}/label_encoder.pkl")
@@ -307,8 +297,11 @@ class DocumentClassifier:
         text = self._extract_text(file_path)
         text = self._preprocess_text(text)
         
+        # 한국어 불용어 목록 (간단한 예시)
+        korean_stopwords = ['이', '그', '저', '것', '및', '등', '를', '을', '에', '의', '은', '는', '이', '가', '와', '과', '으로', '로', '에서']
+        
         # TF-IDF 벡터화
-        vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words=korean_stopwords)
         tfidf_matrix = vectorizer.fit_transform([text])
         
         # 단어 및 TF-IDF 점수
@@ -325,56 +318,55 @@ class DocumentClassifier:
             for word, score in word_scores[:top_k]
         ]
     
-    def suggest_categories(self, file_path):
-        """문서 내용에 기반한 카테고리 제안"""
-        # 키워드 추출
-        keywords = self.extract_keywords(file_path, top_k=20)
-        keyword_list = [k['keyword'] for k in keywords]
-        
-        # 키워드에 기반한 카테고리 예측
-        if self.is_finetuned:
-            prediction = self.predict(file_path)
-            return prediction['top_categories']
-        else:
-            # 학습된 모델이 없을 경우, 키워드만 반환
-            return {
-                'suggested_keywords': keywords
-            }
+    def get_category_features(self):
+        """각 카테고리별 특징적인 키워드 및 패턴"""
+        return {
+            "시험자료": ["문제", "답안", "시험", "테스트", "객관식", "주관식", "보기", "과목", "정답", "채점"],
+            "자소서": ["지원동기", "자기소개", "경력", "역량", "지원자", "지원", "성장과정", "장단점", "인재상", "목표"],
+            "레포트": ["서론", "본론", "결론", "참고문헌", "연구", "분석", "조사", "인용", "자료", "논의"],
+            "이력서": ["경력사항", "학력", "자격증", "연락처", "기술", "경험", "프로젝트", "근무", "담당업무", "성명"]
+        }
 
 # 사용 예시
 if __name__ == "__main__":
     # 모델 초기화
     classifier = DocumentClassifier(model_name='klue/bert-base')
     
-    # 예시: 카테고리 정의
-    categories = [
-        "기술", "과학", "경제", "정치", "사회", "문화", "역사", 
-        "예술", "스포츠", "교육", "건강", "환경", "여행", "음식"
-    ]
-    
     # 훈련 데이터 예시 (파일경로, 카테고리)
     train_data = [
-        ('c:/Users/Lenovo/Desktop/code/Git/AI-from-basic/Block_Chein/doc1.pdf', '기술'),
-        ('c:/Users/Lenovo/Desktop/code/Git/AI-from-basic/Block_Chein/doc2.pdf', '과학'),
-        ('c:/Users/Lenovo/Desktop/code/Git/AI-from-basic/Block_Chein/doc3.pdf', '경제'),
-        # ... 다른 훈련 데이터
+        ('./data/exam1.pdf', '시험자료'),
+        ('./data/exam2.pdf', '시험자료'),
+        ('./data/exam3.pdf', '시험자료'),
+        ('./data/cover1.pdf', '자소서'),
+        ('./data/cover2.pdf', '자소서'),
+        ('./data/cover3.pdf', '자소서'),
+        ('./data/report1.pdf', '레포트'),
+        ('./data/report2.pdf', '레포트'),
+        ('./data/report3.pdf', '레포트'),
+        ('./data/resume1.pdf', '이력서'),
+        ('./data/resume2.pdf', '이력서'),
+        ('./data/resume3.pdf', '이력서'),
     ]
     
     # 모델 학습
-    classifier.train(train_data, categories=categories, epochs=3)
+    classifier.train(train_data, epochs=3)
     
     # 모델 저장
-    classifier.save_model('document_classifier_model')
+    classifier.save_model('korean_document_classifier')
     
     # 모델 로드
     new_classifier = DocumentClassifier()
-    new_classifier.load_model('document_classifier_model')
+    new_classifier.load_model('korean_document_classifier')
     
     # 문서 분류
-    result = new_classifier.predict('c:/Users/Lenovo/Desktop/code/Git/AI-from-basic/Block_Chein/new_document.pdf')
-    print(f"Predicted category: {result['predicted_category']} with confidence: {result['confidence']}")
-    print(f"Top categories: {result['top_categories']}")
+    result = new_classifier.predict('./data/new_document.pdf')
+    print(f"예측된 카테고리: {result['predicted_category']} (확신도: {result['confidence']:.2f})")
+    print(f"각 카테고리별 확률:")
+    for cat, prob in result['category_probabilities'].items():
+        print(f"  - {cat}: {prob:.2f}")
     
     # 키워드 추출
-    keywords = new_classifier.extract_keywords('c:/Users/Lenovo/Desktop/code/Git/AI-from-basic/Block_Chein/new_document.pdf')
-    print(f"Keywords: {keywords}")
+    keywords = new_classifier.extract_keywords('./data/new_document.pdf')
+    print(f"주요 키워드:")
+    for kw in keywords:
+        print(f"  - {kw['keyword']}: {kw['score']:.4f}")
