@@ -29,26 +29,26 @@ class PDFProcessor:
         # API 엔드포인트 설정
         self.api_endpoint = api_endpoint
     
-    def download_file_from_url(self, url):
-        """URL에서 파일 다운로드"""
+    def download_file_from_s3(self, bucket, key):
+        """S3에서 파일 다운로드"""
         try:
-            response = requests.get(url, stream=True)
-            response.raise_for_status()  # 오류 확인
-            
-            # 파일명 추출
-            parsed_url = urlparse(url)
-            filename = os.path.basename(parsed_url.path)
-            
-            # 임시 파일로 저장
-            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1], delete=False) as temp_file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    temp_file.write(chunk)
+            # S3 클라이언트가 없으면 생성
+            if not hasattr(self, 's3_client'):
+                self.s3_client = boto3.client('s3')
+                
+            # 임시 파일로 다운로드
+            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(key)[1], delete=False) as temp_file:
+                self.s3_client.download_fileobj(
+                    Bucket=bucket,
+                    Key=key,
+                    Fileobj=temp_file
+                )
                 temp_path = temp_file.name
-            
-            return temp_path, filename
+                
+            return temp_path
         except Exception as e:
-            print(f"파일 다운로드 오류: {e}")
-            return None, None
+            print(f"S3 파일 다운로드 오류: {e}")
+            return None
     
     def extract_text_from_pdf(self, pdf_path):
         """PDF 파일에서 텍스트 추출 (간소화)"""
@@ -66,11 +66,11 @@ class PDFProcessor:
             return ""
     
     def simple_classify_pdf(self, pdf_path):
-        """간단한 PDF 분류 (MongoDB 없이)"""
+        """간단한 PDF 분류"""
         # 기본 문서 유형
         document_types = ['자기소개서', '이력서', '학습자료', '레포트', '기타']
         
-        # 간단한 키워드 목록 (축소)
+        # 간단한 키워드 목록
         keywords = {
             '자기소개서': ['지원동기', '자기소개', '성장과정', '역량', '목표', 'personal statement'],
             '이력서': ['학력', '경력', '자격증', '기술', '연락처', 'resume', 'CV'],
@@ -102,22 +102,169 @@ class PDFProcessor:
         for doc_type in document_types:
             if scores[doc_type] == max_score:
                 return doc_type
-    
-    def send_to_api(self, file_id, classification_result, original_url, request_id):
-        """분류 결과를 API로 전송"""
+                
+    def advanced_classify_pdf(self, pdf_path):
+        """향상된 PDF 분류 메소드"""
+        # 기본 문서 유형
+        document_types = ['자기소개서', '이력서', '학습자료', '레포트', '기타']
+        
+        # 각 문서 유형별 주요 키워드 정의 (확장)
+        keywords = {
+            '자기소개서': [
+                # 한국어 키워드 (가중치 높음)
+                ('지원동기', 5), ('자기소개', 5), ('성장과정', 4), ('장단점', 4), ('지원이유', 5), 
+                ('역량', 3), ('목표', 2), ('비전', 2), ('성취', 2), ('자소서', 5), ('지원원', 4),
+                ('열정', 2), ('관심분야', 3), ('포부', 3), ('지원자', 2), ('인재상', 3),
+                # 영어 키워드
+                ('personal statement', 5), ('statement of purpose', 5), ('motivation letter', 5), 
+                ('cover letter', 5), ('self introduction', 5), ('background', 2), 
+                ('achievements', 3), ('strengths', 3), ('weaknesses', 3), ('career goal', 3), 
+                ('objective', 2), ('vision', 2), ('why I want', 4), ('reason for applying', 5)
+            ],
+            '이력서': [
+                # 한국어 키워드
+                ('학력', 5), ('경력', 5), ('자격증', 5), ('기술', 4), ('연락처', 5), ('프로젝트', 4), 
+                ('업무', 4), ('성과', 3), ('경험', 4), ('담당업무', 5), ('인적사항', 5),
+                ('생년월일', 5), ('주소', 3), ('핸드폰', 3), ('이메일', 3), ('전화번호', 3),
+                ('최종학력', 5), ('졸업', 4), ('학교', 3), ('전공', 3), ('회사명', 5),
+                # 영어 키워드
+                ('resume', 5), ('curriculum vitae', 5), ('CV', 5), ('education', 5), 
+                ('experience', 5), ('certificate', 4), ('skills', 4), ('contact', 5), 
+                ('project', 3), ('work history', 5), ('responsibilities', 4),
+                ('personal information', 5), ('employment history', 5)
+            ],
+            '학습자료': [
+                # 한국어 키워드
+                ('학습', 4), ('교육', 4), ('교재', 5), ('강의', 5), ('이론', 4), ('개념', 4), 
+                ('설명', 3), ('예제', 5), ('연습문제', 5), ('참고', 2), ('실습', 4), 
+                ('교과서', 5), ('문제', 4), ('구하시오', 5), ('구해라', 5), ('풀이', 5),
+                ('정의', 3), ('공식', 4), ('방정식', 4), ('증명', 4), ('그래프', 3),
+                # 영어 키워드
+                ('lecture', 5), ('course material', 5), ('textbook', 5), ('learning', 4), 
+                ('education', 3), ('theory', 4), ('concept', 3), ('example', 4), 
+                ('exercise', 5), ('practice', 4), ('study guide', 5), ('lesson', 5),
+                ('worksheet', 5), ('tutorial', 5), ('quiz', 5), ('homework', 5)
+            ],
+            '레포트': [
+                # 한국어 키워드
+                ('서론', 5), ('본론', 5), ('결론', 5), ('연구', 5), ('분석', 4), ('조사', 4), 
+                ('참고문헌', 5), ('인용', 5), ('논의', 4), ('평가', 3), ('보고서', 5),
+                ('논문', 5), ('초록', 5), ('요약', 3), ('실험', 4), ('통계', 3),
+                ('표', 2), ('그림', 2), ('목차', 3), ('가설', 4), ('데이터', 3),
+                # 영어 키워드
+                ('introduction', 5), ('body', 3), ('conclusion', 5), ('research', 5), 
+                ('analysis', 4), ('investigation', 4), ('references', 5), ('bibliography', 5), 
+                ('citation', 5), ('discussion', 4), ('evaluation', 3), ('report', 5),
+                ('abstract', 5), ('methodology', 5), ('findings', 4), ('results', 4)
+            ],
+            '기타': []  # 다른 카테고리에 해당하지 않는 경우
+        }
+        
+        # 패턴 정의 (정규표현식)
+        patterns = {
+            '자기소개서': [
+                r'(저는|제가).{0,50}(지원|희망)',  # 한국어 자기소개 패턴
+                r'(I am|I\'m|I have).{0,50}(applying|interested in)'  # 영어 자기소개 패턴
+            ],
+            '이력서': [
+                r'(생년월일|연락처|이메일|Date of Birth|DOB|Phone|Contact|Email).{0,30}:',  # 개인정보 패턴
+                r'\d{4}\s*[년~-]\s*\d{1,2}\s*[월~-]',  # 날짜 패턴 (경력, 학력)
+                r'(education|experience|skills|qualification)[\s\n]*:'  # 영어 이력서 섹션
+            ],
+            '학습자료': [
+                r'(chapter|단원|목차|학습목표|contents|table of contents|learning objectives|lesson)',  # 학습자료 구조
+                r'(문제\s*\d+|\d+\.\s*문제|Exercise\s*\d+|Problem\s*\d+)'  # 문제 번호 패턴
+            ],
+            '레포트': [
+                r'(참고문헌|reference|인용|출처|bibliography|cited|source|abstract)',  # 레포트 요소
+                r'(introduction|methodology|results|conclusion|discussion)',  # 학술 레포트 구조
+                r'\[\d+\]',  # 인용 표기 패턴
+                r'\(\w+,\s*\d{4}\)'  # 인용 표기 패턴 (저자, 연도)
+            ]
+        }
+        
+        # 텍스트 추출
+        text = self.extract_text_from_pdf(pdf_path)
+        if not text or len(text.strip()) < 10:  # 텍스트가 너무 적으면
+            print(f"파일 '{pdf_path}'에서 충분한 텍스트를 추출할 수 없습니다.")
+            return '기타'
+        
+        # 점수 초기화
+        scores = {doc_type: 0 for doc_type in document_types}
+        text_lower = text.lower()
+        
+        # 1. 키워드 점수 계산 (가중치 적용)
+        for doc_type, kw_list in keywords.items():
+            if doc_type == '기타':
+                continue
+                
+            for keyword, weight in kw_list:
+                # 키워드 등장 횟수 확인
+                count = text_lower.count(keyword.lower())
+                if count > 0:
+                    # 가중치를 고려하여 점수 추가
+                    scores[doc_type] += count * weight
+        
+        # 2. 정규표현식 패턴 매칭
+        for doc_type, pattern_list in patterns.items():
+            for pattern in pattern_list:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                if matches:
+                    # 패턴 매치는 높은 점수 부여
+                    scores[doc_type] += len(matches) * 10
+        
+        # 3. 문서 구조 분석
+        # 자기소개서 특성 (자신을 나타내는 말이 많음)
+        first_person_pronouns = ['저는', '제가', '저의', '제', 'I ', 'my', 'me', 'mine']
+        first_person_count = sum(text_lower.count(pronoun.lower()) for pronoun in first_person_pronouns)
+        if first_person_count > 10:
+            scores['자기소개서'] += first_person_count * 2
+        
+        # 이력서 특성 (글머리 기호나 행머리 기호가 많음)
+        bullet_point_pattern = r'(•|\*|\-|\d+\.|\d+\))'
+        bullet_points = re.findall(bullet_point_pattern, text)
+        if len(bullet_points) > 5:
+            scores['이력서'] += len(bullet_points) * 3
+        
+        # 학습자료 특성 (여러 수식이나 기호가 있음)
+        equations = re.findall(r'[=\+\-\*\/\^\(\)\[\]\{\}]+', text)
+        if len(equations) > 10:
+            scores['학습자료'] += len(equations) * 2
+        
+        # 레포트 특성 (긴 문단이 많음)
+        long_paragraphs = len([p for p in text.split('\n\n') if len(p) > 200])
+        if long_paragraphs > 3:
+            scores['레포트'] += long_paragraphs * 5
+        
+        # 최고 점수 문서 유형 반환
+        max_score = max(scores.values())
+        if max_score == 0:
+            return '기타'
+        
+        # 디버깅을 위한 점수 출력
+        print("문서 분류 점수:")
+        for doc_type, score in scores.items():
+            print(f"  {doc_type}: {score}")
+        
+        # 최고 점수 유형 반환 (동점인 경우 우선순위가 높은 유형 선택)
+        for doc_type in document_types:
+            if scores[doc_type] == max_score:
+                return doc_type
+    def send_category_to_api(self, request_id, category):
+        """카테고리 분류 결과를 API로 전송"""
         if not self.api_endpoint:
             print("API 엔드포인트가 설정되지 않았습니다.")
             return False
         
         try:
+            # API 응답 데이터 구성 (요구하는 형식으로)
             payload = {
-                "fileId": file_id,
-                "classificationType": classification_result,
-                "originalUrl": original_url,
-                "requestId": request_id,
-                "processedTimestamp": datetime.datetime.now().isoformat()
+                "request_id": request_id,
+                "is_completed": True,
+                "predicted_category": category
             }
             
+            # API 엔드포인트로 결과 전송
             url = f"{self.api_endpoint}/ai-proxy/category-recommendation-results/{request_id}"
             print(f"API 요청 URL: {url}")
             print(f"API 요청 데이터: {payload}")
@@ -127,6 +274,7 @@ class PDFProcessor:
                 json=payload,
                 headers={"Content-Type": "application/json"}
             )
+            
             response.raise_for_status()
             print(f"API 전송 성공: {response.status_code}")
             return True
@@ -136,40 +284,60 @@ class PDFProcessor:
             return False
     
     def process_sqs_message(self, message):
-        """SQS 메시지 처리 (MongoDB 없이)"""
+        """SQS 메시지 처리 - 카테고리 분류"""
+        # 메시지 본문 파싱 (더 엄격한 JSON 파싱)
         try:
-            # 메시지 본문 파싱
-            message_body = json.loads(message['Body'])
-
-            # 파일 URL과 requestId 추출
-            file_url = message_body.get('fileUrl')
-            request_id = message_body.get('requestId')
-
-            if not file_url:
-                print("메시지에 fileUrl이 없습니다.")
-                return False
-
-            if not request_id:
-                print("메시지에 requestId가 없습니다.")
-                return False
-                
-            print(f"파일 URL 처리 중: {file_url}, 요청 ID: {request_id}")
+            message_body = json.loads(message['Body'].replace("'", '"'))
+        except json.JSONDecodeError as json_err:
+            print(f"JSON 파싱 오류: {json_err}")
+            print(f"원본 메시지: {message['Body']}")
+            return False
+        
+        # 요청 유형 처리
+        request_type = message_body.get('request_type')
+        print(f"수신된 request_type: {request_type}")
+        
+        # 지원되는 요청 유형 확장
+        supported_types = [
+            'file_duplicate_check_embedding_file', 
+            'category_recommendation'
+        ]
+        
+        if request_type not in supported_types:
+            print(f"지원하지 않는 request_type: {request_type}")
+            return False
+        
+        # 공통 필드 확인
+        request_id = message_body.get('request_id')
+        if not request_id:
+            print("메시지에 request_id가 없습니다.")
+            return False
+        
+        # 요청 유형별 처리
+        if request_type == 'file_duplicate_check_embedding_file':
+            # 기존 S3 파일 처리 로직
+            payload = message_body.get('payload', {})
+            s3_bucket = payload.get('s3_bucket')
+            s3_key = payload.get('s3_key')
             
-            # URL에서 파일 다운로드
-            temp_path, filename = self.download_file_from_url(file_url)
+            if not s3_bucket or not s3_key:
+                print("메시지 페이로드에 s3_bucket 또는 s3_key가 없습니다.")
+                return False
+            
+            print(f"파일 처리 중: {s3_bucket}/{s3_key}, 요청 ID: {request_id}")
+            
+            # S3에서 파일 다운로드
+            temp_path = self.download_file_from_s3(s3_bucket, s3_key)
             if not temp_path:
-                print("파일 다운로드에 실패했습니다.")
+                print("S3에서 파일 다운로드에 실패했습니다.")
                 return False
             
             try:
-                # PDF 파일 분류 (간소화된 방식)
-                doc_type = self.simple_classify_pdf(temp_path)
+                # PDF 파일 분류 (향상된 방식)
+                category = self.advanced_classify_pdf(temp_path)    
                 
-                # 임시 파일 ID 생성 (MongoDB 없이)
-                file_id = f"temp_{int(time.time())}_{request_id}"
-                
-                # 분류 결과를 API로 전송
-                api_result = self.send_to_api(file_id, doc_type, file_url, request_id)
+                # 분석 결과를 API로 전송
+                api_result = self.send_category_to_api(request_id, category)
                 
                 # 임시 파일 삭제
                 os.unlink(temp_path)
@@ -184,11 +352,42 @@ class PDFProcessor:
                 except:
                     pass
                 return False
+        
+        elif request_type == 'category_recommendation':
+            payload = message_body.get('payload', {})
+            s3_bucket = payload.get('s3_bucket')
+            s3_key = payload.get('s3_key')
+            
+            if not s3_bucket or not s3_key:
+                print("메시지 페이로드에 s3_bucket 또는 s3_key가 없습니다.")
+                return False
+            
+            print(f"파일 처리 중: {s3_bucket}/{s3_key}, 요청 ID: {request_id}")
+            
+            # S3에서 파일 다운로드
+            temp_path = self.download_file_from_s3(s3_bucket, s3_key)
+            if not temp_path:
+                print("S3에서 파일 다운로드에 실패했습니다.")
+                return False
+            
+            try:
+                # PDF 파일 분류 (향상된 방식)
+                category = self.advanced_classify_pdf(temp_path)    
                 
-        except Exception as e:
-            print(f"메시지 처리 오류: {e}")
-            return False
-    
+                # 분석 결과를 API로 전송
+                api_result = self.send_category_to_api(request_id, category)
+                
+                # 임시 파일 삭제
+                os.unlink(temp_path)
+                
+                return api_result
+                
+            except Exception as e:
+                print(f"메시지 처리 오류: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+            
     def poll_sqs_queue(self, max_messages=10, wait_time=20, visibility_timeout=60):
         """SQS 대기열에서 메시지 폴링"""
         if not self.sqs_client or not self.sqs_queue_url:
