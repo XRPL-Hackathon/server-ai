@@ -1,49 +1,263 @@
 import os
 import re
+import json
+import time
+import boto3
+import requests
+import tempfile
+from urllib.parse import urlparse
+from io import BytesIO
 from PyPDF2 import PdfReader
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import Pipeline
 import warnings
+from pymongo import MongoClient
+import gridfs
+from bson.objectid import ObjectId
 
-# 필요한 라이브러리 존재 확인
-def check_required_libraries():
-    missing_libraries = []
+# MongoDB 연결 설정
+def get_mongodb_connection(connection_string='mongodb://localhost:27017/'):
+    """MongoDB 연결 객체 반환"""
     try:
-        import pytesseract
-    except ImportError:
-        missing_libraries.append("pytesseract")
-    
-    try:
-        import pdf2image
-    except ImportError:
-        missing_libraries.append("pdf2image")
-    
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        missing_libraries.append("PyMuPDF")
-    
-    if missing_libraries:
-        print("경고: 다음 라이브러리가 없어 일부 기능이 제한됩니다:")
-        for lib in missing_libraries:
-            print(f"- {lib}")
-        print("설치 방법: pip install " + " ".join(missing_libraries))
-        return False
-    
-    return True
+        client = MongoClient(connection_string)
+        # 연결 테스트
+        client.admin.command('ping')
+        print("MongoDB에 성공적으로 연결되었습니다.")
+        return client
+    except Exception as e:
+        print(f"MongoDB 연결 오류: {e}")
+        return None
 
+# AWS SQS 설정
+def get_sqs_client(region_name='ap-northeast-2'):
+    """AWS SQS 클라이언트 반환"""
+    try:
+        # AWS 자격 증명을 환경 변수나 IAM 역할로부터 가져옴
+        sqs = boto3.client('sqs', region_name=region_name)
+        return sqs
+    except Exception as e:
+        print(f"AWS SQS 클라이언트 생성 오류: {e}")
+        return None
+
+class PDFProcessor:
+    def __init__(self, mongodb_client=None, db_name="pdf_classifier_db", sqs_queue_url=None, api_endpoint=None):
+        # MongoDB 설정
+        self.mongodb_client = mongodb_client
+        self.db_name = db_name
+        
+        if self.mongodb_client:
+            self.db = self.mongodb_client[db_name]
+            self.fs = gridfs.GridFS(self.db)
+        else:
+            self.db = None
+            self.fs = None
+        
+        # SQS 설정
+        self.sqs_queue_url = sqs_queue_url
+        self.sqs_client = get_sqs_client() if sqs_queue_url else None
+        
+        # API 엔드포인트 설정
+        self.api_endpoint = api_endpoint
+        
+        # PDF 분류기 초기화
+        self.classifier = PDFClassifier(mongodb_client, db_name)
+    
+    def download_file_from_url(self, url):
+        """URL에서 파일 다운로드"""
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()  # 오류 확인
+            
+            # 파일명 추출
+            parsed_url = urlparse(url)
+            filename = os.path.basename(parsed_url.path)
+            
+            # 임시 파일로 저장
+            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1], delete=False) as temp_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    temp_file.write(chunk)
+                temp_path = temp_file.name
+            
+            return temp_path, filename
+        except Exception as e:
+            print(f"파일 다운로드 오류: {e}")
+            return None, None
+    
+    def send_to_api(self, file_id, classification_result, original_url, request_id):
+        """분류 결과를 API로 전송"""
+        if not self.api_endpoint:
+            print("API 엔드포인트가 설정되지 않았습니다.")
+            return False
+        
+        try:
+            payload = {
+                "fileId": str(file_id),
+                "classificationType": classification_result,
+                "originalUrl": original_url,
+                "requestId": request_id,  # requestId 추가
+                "processedTimestamp": pd.Timestamp.now().isoformat()
+            }
+            
+            response = requests.post(
+                f"{self.api_endpoint}/ai-proxy/category-recommendation-results/{request_id}",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            print(f"API 전송 성공: {response.status_code}")
+            return True
+            
+        except Exception as e:
+            print(f"API 전송 오류: {e}")
+            return False
+    
+    def process_sqs_message(self, message):
+        """SQS 메시지 처리"""
+        try:
+            # 메시지 본문 파싱
+            message_body = json.loads(message['Body'])
+
+            # 파일 URL과 requestId 추출
+            file_url = message_body.get('fileUrl')
+            request_id = message_body.get('requestId')  # requestId 추출
+
+            if not file_url:
+                print("메시지에 fileUrl이 없습니다.")
+                return False
+
+            if not request_id:
+                print("메시지에 requestId가 없습니다.")
+                return False
+            print(f"파일 URL 처리 중: {file_url}")
+            
+            # URL에서 파일 다운로드
+            temp_path, filename = self.download_file_from_url(file_url)
+            if not temp_path:
+                print("파일 다운로드에 실패했습니다.")
+                return False
+            
+            try:
+                # MongoDB에 PDF 파일 업로드
+                file_id = self.classifier.upload_pdf_to_db(temp_path, {"original_url": file_url})
+                
+                if not file_id:
+                    print("MongoDB에 파일 업로드 실패")
+                    return False
+                
+                # PDF 파일 분류
+                doc_type = self.classifier.classify_pdf(temp_path, save_to_db=True)
+                
+                # 분류 결과를 API로 전송
+                api_result = self.send_to_api(file_id, doc_type, file_url, request_id)
+                
+                # 임시 파일 삭제
+                os.unlink(temp_path)
+                
+                return api_result
+                
+            except Exception as e:
+                print(f"파일 처리 오류: {e}")
+                # 임시 파일 삭제 시도
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                return False
+                
+        except Exception as e:
+            print(f"메시지 처리 오류: {e}")
+            return False
+    
+    def poll_sqs_queue(self, max_messages=10, wait_time=20, visibility_timeout=60):
+        """SQS 대기열에서 메시지 폴링"""
+        if not self.sqs_client or not self.sqs_queue_url:
+            print("SQS 클라이언트 또는 대기열 URL이 설정되지 않았습니다.")
+            return False
+        
+        try:
+            # SQS 대기열에서 메시지 수신
+            response = self.sqs_client.receive_message(
+                QueueUrl=self.sqs_queue_url,
+                MaxNumberOfMessages=max_messages,
+                WaitTimeSeconds=wait_time,
+                VisibilityTimeout=visibility_timeout,
+                AttributeNames=['All'],
+                MessageAttributeNames=['All']
+            )
+            
+            messages = response.get('Messages', [])
+            processed_count = 0
+            
+            if not messages:
+                print("처리할 메시지가 없습니다.")
+                return True
+            
+            print(f"{len(messages)}개의 메시지를 처리합니다.")
+            
+            for message in messages:
+                receipt_handle = message['ReceiptHandle']
+                
+                # 메시지 처리
+                success = self.process_sqs_message(message)
+                
+                if success:
+                    # 처리 성공 시 메시지 삭제
+                    self.sqs_client.delete_message(
+                        QueueUrl=self.sqs_queue_url,
+                        ReceiptHandle=receipt_handle
+                    )
+                    processed_count += 1
+                else:
+                    # 처리 실패 시 메시지 가시성 타임아웃 변경 (다시 처리할 수 있도록)
+                    self.sqs_client.change_message_visibility(
+                        QueueUrl=self.sqs_queue_url,
+                        ReceiptHandle=receipt_handle,
+                        VisibilityTimeout=0  # 즉시 다시 처리 가능하도록
+                    )
+            
+            print(f"{processed_count}/{len(messages)}개의 메시지를 성공적으로 처리했습니다.")
+            return True
+            
+        except Exception as e:
+            print(f"SQS 폴링 오류: {e}")
+            return False
+    
+    def start_polling_loop(self, polling_interval=60):
+        """SQS 대기열에서 메시지 폴링 루프 시작"""
+        print(f"SQS 대기열 폴링 시작: {self.sqs_queue_url}")
+        try:
+            while True:
+                self.poll_sqs_queue()
+                # 다음 폴링 전 대기
+                time.sleep(polling_interval)
+        except KeyboardInterrupt:
+            print("폴링 루프 중단")
+
+
+# 기존 PDFClassifier 클래스 (필요한 메소드 추가)
 class PDFClassifier:
-    def __init__(self):
+    def __init__(self, mongodb_client=None, db_name="pdf_classifier_db"):
         # 문서 유형 정의
         self.document_types = ['자기소개서', '이력서', '학습자료', '레포트', '기타']
+        
+        # MongoDB 클라이언트 설정
+        self.mongodb_client = mongodb_client
+        self.db_name = db_name
+        
+        if self.mongodb_client:
+            self.db = self.mongodb_client[db_name]
+            self.fs = gridfs.GridFS(self.db)  # GridFS 설정 (PDF 파일 저장용)
+        else:
+            self.db = None
+            self.fs = None
         
         # 각 문서 유형별 주요 키워드 정의
         self.keywords = {
             '자기소개서': [
                 # 한국어 키워드
-                '지원동기', '자기소개', '성장과정', '장단점', '지원이유', '역량', '목표', '비전', '성취', '자소서', '지원원'
+                '지원동기', '자기소개', '성장과정', '장단점', '지원이유', '역량', '목표', '비전', '성취', '자소서', '지원원',
                 # 영어 키워드
                 'personal statement', 'statement of purpose', 'motivation letter', 'cover letter', 
                 'self introduction', 'background', 'achievements', 'strengths', 'weaknesses', 
@@ -60,7 +274,7 @@ class PDFClassifier:
             '학습자료': [
                 # 한국어 키워드
                 '학습', '교육', '교재', '강의', '이론', '개념', '설명', '예제', '연습문제', '참고', '실습', 
-                '교과서', '문제', '구하시오' , '구해라'
+                '교과서', '문제', '구하시오' , '구해라',
                 # 영어 키워드
                 'lecture', 'course material', 'textbook', 'learning', 'education', 'theory', 
                 'concept', 'example', 'exercise', 'practice', 'study guide', 'reference material',
@@ -78,13 +292,39 @@ class PDFClassifier:
             '기타': []  # 다른 카테고리에 해당하지 않는 경우
         }
         
-        # 기계학습 모델 초기화 (선택적으로 사용)
+        # 기계학습 모델 초기화
         self.model = None
-        
-    def count_word_frequency(self, text):
-        """문서에서 단어 빈도 계산"""
-        words = re.findall(r'\b\w+\b', text.lower())
-        return {word: words.count(word) for word in set(words)}
+
+    def upload_pdf_to_db(self, pdf_path, metadata=None):
+        """PDF 파일을 MongoDB의 GridFS에 업로드"""
+        if not self.db or not self.fs:
+            print("MongoDB 연결이 설정되지 않아 업로드할 수 없습니다.")
+            return None
+            
+        try:
+            with open(pdf_path, 'rb') as pdf_file:
+                file_data = pdf_file.read()
+                
+            # 기본 메타데이터 설정
+            meta = {
+                'filename': os.path.basename(pdf_path),
+                'content_type': 'application/pdf',
+                'uploaded_date': pd.Timestamp.now()
+            }
+            
+            # 사용자 지정 메타데이터 추가
+            if metadata:
+                meta.update(metadata)
+                
+            # GridFS에 파일 저장
+            file_id = self.fs.put(file_data, **meta)
+            print(f"파일 '{os.path.basename(pdf_path)}'이(가) MongoDB에 업로드되었습니다. (ID: {file_id})")
+            
+            return file_id
+            
+        except Exception as e:
+            print(f"PDF 업로드 오류: {e}")
+            return None
     
     def extract_text_from_pdf(self, pdf_path):
         """PDF 파일에서 텍스트 추출 (일반 + OCR)"""
@@ -133,19 +373,6 @@ class PDFClassifier:
             print(f"OCR 처리 오류: {e}")
             return ""
     
-    def train_model(self, training_data):
-        """텍스트 분류 모델 학습 (예시 데이터 필요)"""
-        # training_data는 {'text': [...], 'label': [...]} 형태의 딕셔너리
-        df = pd.DataFrame(training_data)
-        
-        # TF-IDF와 나이브 베이즈 분류기를 파이프라인으로 구성
-        self.model = Pipeline([
-            ('tfidf', TfidfVectorizer(max_features=5000, ngram_range=(1, 2))),
-            ('clf', MultinomialNB())
-        ])
-        
-        self.model.fit(df['text'], df['label'])
-    
     def rule_based_classification(self, text):
         """규칙 기반 문서 분류"""
         scores = {doc_type: 0 for doc_type in self.document_types}
@@ -185,15 +412,7 @@ class PDFClassifier:
             if scores[doc_type] == max_score:
                 return doc_type
     
-    def model_based_classification(self, text):
-        """모델 기반 문서 분류"""
-        if self.model is None:
-            return None  # 모델이 학습되지 않은 경우
-        
-        prediction = self.model.predict([text])[0]
-        return prediction
-    
-    def classify_pdf(self, pdf_path, use_model=False):
+    def classify_pdf(self, pdf_path, use_model=False, save_to_db=True):
         """PDF 파일 분류하기"""
         text = self.extract_text_from_pdf(pdf_path)
         
@@ -202,14 +421,28 @@ class PDFClassifier:
             print(f"'{pdf_path}' 파일을 AI 모델을 사용하여 분석합니다...")
             doc_type = self.classify_with_ai(pdf_path)
             if doc_type:
+                result = {
+                    'filename': os.path.basename(pdf_path),
+                    'path': pdf_path,
+                    'type': doc_type,
+                    'classification_method': 'AI',
+                    'extracted_text': text,
+                    'classified_at': pd.Timestamp.now()
+                }
+                
+                if save_to_db and self.db:
+                    self.save_classification_to_db(result)
+                
                 return doc_type
             return '분류 불가'
         
         if use_model and self.model is not None:
-            return self.model_based_classification(text)
+            doc_type = self.model_based_classification(text)
+            classification_method = 'model'
         else:
             # 규칙 기반 분류 실행
             doc_type = self.rule_based_classification(text)
+            classification_method = 'rule_based'
             
             # '기타' 카테고리로 분류된 경우 추가 검사
             if doc_type == '기타':
@@ -224,12 +457,43 @@ class PDFClassifier:
                     print(f"'{pdf_path}' 파일을 AI 모델을 사용하여 추가 분석합니다...")
                     ai_doc_type = self.classify_with_ai(pdf_path)
                     if ai_doc_type:
-                        return ai_doc_type
+                        doc_type = ai_doc_type
+                        classification_method = 'AI'
                     
                     # AI 분석도 실패하면 '분류 불가'로 변경
-                    return '분류 불가'
+                    if doc_type == '기타':
+                        doc_type = '분류 불가'
+        
+        # 분류 결과를 MongoDB에 저장
+        if save_to_db and self.db:
+            result = {
+                'filename': os.path.basename(pdf_path),
+                'path': pdf_path,
+                'type': doc_type,
+                'classification_method': classification_method,
+                'extracted_text': text[:1000],  # 텍스트 일부만 저장
+                'classified_at': pd.Timestamp.now()
+            }
+            self.save_classification_to_db(result)
+        
+        return doc_type
+        
+    def save_classification_to_db(self, result):
+        """MongoDB에 분류 결과 저장"""
+        if not self.db:
+            print("MongoDB 연결이 설정되지 않아 저장할 수 없습니다.")
+            return None
+        
+        try:
+            # MongoDB에 분류 결과 저장
+            inserted_id = self.db.classification_results.insert_one(result).inserted_id
+            print(f"파일 '{result['filename']}'의 분류 결과가 MongoDB에 저장되었습니다. (ID: {inserted_id})")
             
-            return doc_type
+            return inserted_id
+        
+        except Exception as e:
+            print(f"MongoDB 저장 오류: {e}")
+            return None
             
     def classify_with_ai(self, pdf_path):
         """AI 모델을 사용한 PDF 문서 분류"""
@@ -267,36 +531,7 @@ class PDFClassifier:
                 if metadata.get('title') and any(kw in metadata.get('title', '').lower() for kw in ['교재', '학습', '강의', 'textbook', 'lecture']):
                     return '학습자료'
                 
-                # 외부 AI 서비스 호출 (OpenAI, Google Cloud Vision 등)
-                # 여기서는 구현 예시만 제공, 실제 구현 시 적절한 API 키가 필요합니다
-                """
-                import openai
-                
-                # API 키 설정
-                openai.api_key = "YOUR_API_KEY"
-                
-                # 문서 특성 설명
-                document_features = f"파일명: {filename}, 텍스트 존재: {has_text}, 이미지 존재: {has_images}"
-                if text:
-                    # 텍스트가 있으면 일부 추가 (너무 길면 잘라냄)
-                    document_features += f", 텍스트 샘플: {text[:500]}"
-                
-                # AI에 문서 유형 질문
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "PDF 문서의 유형을 분류해주세요. 가능한 유형은 '자기소개서', '이력서', '학습자료', '레포트', '기타'입니다."},
-                        {"role": "user", "content": f"다음 문서 특성을 바탕으로 문서 유형을 분류해주세요: {document_features}"}
-                    ]
-                )
-                
-                # AI 응답 처리
-                ai_response = response.choices[0].message.content.strip().lower()
-                
-                for doc_type in self.document_types:
-                    if doc_type.lower() in ai_response:
-                        return doc_type
-                """
+                # 외부 AI 서비스 호출 코드는 생략 (기존과 동일)
                 
                 # 실제 API 호출 없이 문서 특성 기반 추정 반환
                 if not has_text and has_images:
@@ -356,134 +591,31 @@ class PDFClassifier:
         except Exception as e:
             print(f"AI 기반 분류 오류: {e}")
             return None
-    
-    def classify_directory(self, directory_path, use_model=False):
-        """디렉토리 내 모든 PDF 파일 분류"""
-        results = []
-        unclassifiable_files = []
-        
-        for filename in os.listdir(directory_path):
-            if filename.lower().endswith('.pdf'):
-                pdf_path = os.path.join(directory_path, filename)
-                doc_type = self.classify_pdf(pdf_path, use_model)
-                
-                if doc_type == '분류 불가':
-                    unclassifiable_files.append({
-                        'filename': filename,
-                        'path': pdf_path,
-                        'reason': '텍스트 추출 실패 또는 충분한 특징 없음'
-                    })
-                
-                results.append({
-                    'filename': filename,
-                    'path': pdf_path,
-                    'type': doc_type
-                })
-        
-        if unclassifiable_files:
-            print("\n===== 분류 불가 파일 목록 =====")
-            for file in unclassifiable_files:
-                print(f"파일명: {file['filename']}")
-                print(f"경로: {file['path']}")
-                print(f"사유: {file['reason']}")
-                print("-" * 50)
-        
-        return results, unclassifiable_files
-    
-    def generate_report(self, classification_results, unclassifiable_files=None, output_path=None):
-        """분류 결과 보고서 생성"""
-        df = pd.DataFrame(classification_results)
-        
-        # 결과 요약
-        summary = pd.DataFrame(df['type'].value_counts()).reset_index()
-        summary.columns = ['문서 유형', '개수']
-        
-        print("\n===== 문서 분류 결과 =====")
-        print(f"총 문서 수: {len(df)}")
-        print("\n문서 유형별 개수:")
-        print(summary)
-        
-        if unclassifiable_files and len(unclassifiable_files) > 0:
-            print(f"\n분류 불가 파일 수: {len(unclassifiable_files)}")
-            print("\n===== 분류 불가 파일 상세 정보 =====")
-            for i, file in enumerate(unclassifiable_files, 1):
-                print(f"{i}. {file['filename']}")
-                print(f"   경로: {file['path']}")
-                print(f"   사유: {file['reason']}")
-        
-        if output_path:
-            # 기본 분류 결과 저장
-            df.to_csv(output_path, index=False, encoding='utf-8-sig')
-            print(f"\n상세 결과가 '{output_path}'에 저장되었습니다.")
-            
-            # 분류 불가 파일 정보 저장
-            if unclassifiable_files and len(unclassifiable_files) > 0:
-                unclassifiable_df = pd.DataFrame(unclassifiable_files)
-                unclassifiable_output = output_path.replace('.csv', '_unclassifiable.csv')
-                unclassifiable_df.to_csv(unclassifiable_output, index=False, encoding='utf-8-sig')
-                print(f"분류 불가 파일 정보가 '{unclassifiable_output}'에 저장되었습니다.")
-        
-        return df
-    
 
-# 사용 예시
+
+# 메인 함수 (AWS SQS + MongoDB 사용 예시)
+def main():
+    # MongoDB 연결
+    mongo_client = get_mongodb_connection("mongodb://localhost:27017/")
+    
+    if not mongo_client:
+        print("MongoDB 연결 실패. 프로그램을 종료합니다.")
+        return
+    
+    # SQS 대기열 URL 및 API 엔드포인트 설정
+    sqs_queue_url = "https://sqs.ap-northeast-2.amazonaws.com/your-account-id/your-queue-name"
+    api_endpoint = "https://your-api-endpoint.com"
+    
+    # PDF 처리기 초기화
+    processor = PDFProcessor(
+        mongodb_client=mongo_client,
+        db_name="pdf_classifier_db",
+        sqs_queue_url=sqs_queue_url,
+        api_endpoint=api_endpoint
+    )
+    
+    # SQS 폴링 루프 시작
+    processor.start_polling_loop()
+
 if __name__ == "__main__":
-    # 필요 라이브러리 확인
-    has_all_libraries = check_required_libraries()
-    
-    classifier = PDFClassifier()
-    
-    # 단일 PDF 파일 분류
-    # pdf_path = "example.pdf"
-    # doc_type = classifier.classify_pdf(pdf_path)
-    # print(f"파일 '{pdf_path}'의 문서 유형: {doc_type}")
-    
-    # 디렉토리 내 모든 PDF 파일 분류
-    # 경로를 지정할 때는 다음 방법 중 하나를 사용하세요:
-    # 1. 원시 문자열(raw string)을 사용 (r 접두사)
-    directory_path = r"C:\Users\Lenovo\Desktop\data"  
-    # 또는
-    # 2. 이중 백슬래시 사용
-    # directory_path = "C:\\Users\\Lenovo\\Desktop\\data"
-    # 또는 
-    # 3. 정방향 슬래시 사용
-    # directory_path = "C:/Users/Lenovo/Desktop/data"
-    
-    if os.path.exists(directory_path):
-        print(f"\n{directory_path} 디렉토리의 PDF 파일 분류를 시작합니다...")
-        print("이미지 기반 PDF는 OCR 및 AI 분석이 적용됩니다.")
-        
-        results, unclassifiable_files = classifier.classify_directory(directory_path)
-        classifier.generate_report(results, unclassifiable_files, "classification_results.csv")
-        
-        if unclassifiable_files:
-            print(f"\n총 {len(unclassifiable_files)}개 파일을 분류할 수 없었습니다.")
-            print("자세한 내용은 'classification_results_unclassifiable.csv' 파일을 확인하세요.")
-    else:
-        print(f"'{directory_path}' 디렉토리가 존재하지 않습니다.")
-
-    # 모델 학습 예시 (실제 데이터 필요)
-    """
-    # 예시 학습 데이터
-    training_data = {
-        'text': [
-            # 자기소개서 예시들...
-            "저는 귀사에 지원하게 되어 매우 기쁩니다. 제 성장과정과 역량을 말씀드리겠습니다...",
-            # 이력서 예시들...
-            "이름: 홍길동\n생년월일: 1990.01.01\n학력: 서울대학교\n경력: ABC회사 2018-2022",
-            # 학습자료 예시들...
-            "Chapter 1. 기초 개념\n이 교재는 학습자들이 쉽게 이해할 수 있도록 구성되었습니다...",
-            # 레포트 예시들...
-            "서론\n본 연구에서는 다음과 같은 가설을 세웠다...\n본론\n...\n결론\n...\n참고문헌",
-        ],
-        'label': [
-            '자기소개서', '이력서', '학습자료', '레포트'
-            # ... 더 많은 예시들 ...
-        ]
-    }
-    classifier.train_model(training_data)
-    
-    # 학습된 모델로 분류
-    results = classifier.classify_directory(directory_path, use_model=True)
-    classifier.generate_report(results, "model_classification_results.csv")
-    """
+    main()
