@@ -19,6 +19,246 @@ from pymongo import MongoClient
 from bson import ObjectId
 import datetime
 import pickle
+import boto3
+import json
+import requests
+import tempfile
+from urllib.parse import urlparse
+import time
+
+class DuplicateDetectionProcessor:
+    def __init__(self, model_name='paraphrase-multilingual-MiniLM-L12-v2', use_gpu=False, 
+                 similarity_threshold=0.85, mongo_uri='mongodb://localhost:27017', 
+                 db_name='document_db', sqs_queue_url=None, api_endpoint=None,
+                 region_name='ap-northeast-2'):
+        """
+        SQS와 API 통합을 위한 문서 중복 감지 프로세서
+        
+        Args:
+            model_name (str): 사용할 임베딩 모델 이름
+            use_gpu (bool): GPU 사용 여부
+            similarity_threshold (float): 중복으로 판단할 유사도 임계값 (0~1)
+            mongo_uri (str): MongoDB 연결 URI
+            db_name (str): 사용할 데이터베이스 이름
+            sqs_queue_url (str): AWS SQS 큐 URL
+            api_endpoint (str): 결과를 전송할 API 엔드포인트 기본 URL
+            region_name (str): AWS 리전
+        """
+        # 중복 감지 모델 초기화
+        self.duplicate_model = DuplicateDetectionModel(
+            model_name=model_name,
+            use_gpu=use_gpu,
+            similarity_threshold=similarity_threshold,
+            mongo_uri=mongo_uri,
+            db_name=db_name
+        )
+        
+        # SQS 설정
+        self.sqs_queue_url = sqs_queue_url
+        self.sqs_client = boto3.client('sqs', region_name=region_name) if sqs_queue_url else None
+        
+        # S3 클라이언트 설정
+        self.s3_client = boto3.client('s3', region_name=region_name)
+        
+        # API 엔드포인트 설정
+        self.api_endpoint = api_endpoint
+    
+    def download_file_from_s3(self, s3_url):
+        """S3 URL에서 파일 다운로드"""
+        try:
+            # s3://bucket/key 형식에서 버킷과 키 추출
+            if s3_url.startswith('s3://'):
+                parts = s3_url[5:].split('/', 1)
+                bucket = parts[0]
+                key = parts[1] if len(parts) > 1 else ''
+            else:
+                raise ValueError(f"잘못된 S3 URL 형식: {s3_url}")
+            
+            # 파일명 추출
+            filename = os.path.basename(key)
+            if not filename:
+                filename = f"file_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            # 임시 파일로 다운로드
+            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1], delete=False) as temp_file:
+                self.s3_client.download_fileobj(
+                    Bucket=bucket,
+                    Key=key,
+                    Fileobj=temp_file
+                )
+                temp_path = temp_file.name
+            
+            return temp_path, filename
+        except Exception as e:
+            print(f"S3 파일 다운로드 오류: {e}")
+            return None, None
+    
+    def send_to_api(self, request_id, file_id, is_duplicated):
+        """분석 결과를 API로 전송"""
+        if not self.api_endpoint:
+            print("API 엔드포인트가 설정되지 않았습니다.")
+            return False
+        
+        try:
+            # API 응답 데이터 구성
+            result_data = {
+                'request_id': request_id,
+                'file_id': file_id,
+                'is_completed': True,
+                'is_duplicated': is_duplicated
+            }
+            
+            # API 엔드포인트로 결과 전송
+            response = requests.post(
+                f"{self.api_endpoint}/ai-proxy/file-duplicate-check-embeddings",
+                json=result_data,
+                headers={"Content-Type": "application/json"}
+            )
+            
+            response.raise_for_status()
+            print(f"API 전송 성공: {response.status_code}")
+            return True
+            
+        except Exception as e:
+            print(f"API 전송 오류: {e}")
+            return False
+    
+    def process_sqs_message(self, message):
+        """SQS 메시지 처리"""
+        try:
+            # 메시지 본문 파싱
+            message_body = json.loads(message['Body'])
+            
+            # 필수 필드 확인
+            request_type = message_body.get('request_type')
+            if request_type != 'file_duplicate_check_embedding_file':
+                print(f"지원하지 않는 request_type: {request_type}")
+                return False
+            
+            request_id = message_body.get('request_id')
+            if not request_id:
+                print("메시지에 request_id가 없습니다.")
+                return False
+            
+            # 페이로드 확인
+            payload = message_body.get('payload', {})
+            s3_url = payload.get('s3_url')
+            if not s3_url:
+                print("메시지 페이로드에 s3_url이 없습니다.")
+                return False
+            
+            user_id = message_body.get('user_id')
+            
+            print(f"파일 처리 중: {s3_url}, 요청 ID: {request_id}")
+            
+            # S3에서 파일 다운로드
+            temp_path, filename = self.download_file_from_s3(s3_url)
+            if not temp_path:
+                print("S3에서 파일 다운로드에 실패했습니다.")
+                return False
+            
+            try:
+                # 메타데이터 구성
+                metadata = {
+                    'request_id': request_id,
+                    'user_id': user_id,
+                    's3_url': s3_url,
+                    'filename': filename
+                }
+                
+                # 중복 문서 검사 수행
+                result = self.duplicate_model.add_document(temp_path, metadata)
+                
+                # 결과 처리
+                file_id = result.get('document_id') if not result.get('is_duplicate') else result.get('duplicate_id')
+                is_duplicated = result.get('is_duplicate', False)
+                
+                # 분석 결과를 API로 전송
+                api_result = self.send_to_api(request_id, file_id, is_duplicated)
+                
+                # 임시 파일 삭제
+                os.unlink(temp_path)
+                
+                return api_result
+                
+            except Exception as e:
+                print(f"파일 처리 오류: {e}")
+                # 임시 파일 삭제 시도
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                return False
+                
+        except Exception as e:
+            print(f"메시지 처리 오류: {e}")
+            return False
+    
+    def poll_sqs_queue(self, max_messages=10, wait_time=20, visibility_timeout=60):
+        """SQS 대기열에서 메시지 폴링"""
+        if not self.sqs_client or not self.sqs_queue_url:
+            print("SQS 클라이언트 또는 대기열 URL이 설정되지 않았습니다.")
+            return False
+        
+        try:
+            # SQS 대기열에서 메시지 수신
+            response = self.sqs_client.receive_message(
+                QueueUrl=self.sqs_queue_url,
+                MaxNumberOfMessages=max_messages,
+                WaitTimeSeconds=wait_time,
+                VisibilityTimeout=visibility_timeout,
+                AttributeNames=['All'],
+                MessageAttributeNames=['All']
+            )
+            
+            messages = response.get('Messages', [])
+            processed_count = 0
+            
+            if not messages:
+                print("처리할 메시지가 없습니다.")
+                return True
+            
+            print(f"{len(messages)}개의 메시지를 처리합니다.")
+            
+            for message in messages:
+                receipt_handle = message['ReceiptHandle']
+                
+                # 메시지 처리
+                success = self.process_sqs_message(message)
+                
+                if success:
+                    # 처리 성공 시 메시지 삭제
+                    self.sqs_client.delete_message(
+                        QueueUrl=self.sqs_queue_url,
+                        ReceiptHandle=receipt_handle
+                    )
+                    processed_count += 1
+                else:
+                    # 처리 실패 시 메시지 가시성 타임아웃 변경 (다시 처리할 수 있도록)
+                    self.sqs_client.change_message_visibility(
+                        QueueUrl=self.sqs_queue_url,
+                        ReceiptHandle=receipt_handle,
+                        VisibilityTimeout=0  # 즉시 다시 처리 가능하도록
+                    )
+            
+            print(f"{processed_count}/{len(messages)}개의 메시지를 성공적으로 처리했습니다.")
+            return True
+            
+        except Exception as e:
+            print(f"SQS 폴링 오류: {e}")
+            return False
+    
+    def start_polling_loop(self, polling_interval=60):
+        """SQS 대기열에서 메시지 폴링 루프 시작"""
+        print(f"SQS 대기열 폴링 시작: {self.sqs_queue_url}")
+        try:
+            while True:
+                self.poll_sqs_queue()
+                # 다음 폴링 전 대기
+                time.sleep(polling_interval)
+        except KeyboardInterrupt:
+            print("폴링 루프 중단")
+
 
 class DuplicateDetectionModel:
     def __init__(self, model_name='paraphrase-multilingual-MiniLM-L12-v2', use_gpu=False, similarity_threshold=0.85,
@@ -241,198 +481,71 @@ class DuplicateDetectionModel:
         
         return similar_doc_info
     
-    def get_document_by_id(self, document_id):
-        """ID로 문서 정보 조회"""
-        return self.documents_collection.find_one({"_id": ObjectId(document_id)})
+    # 나머지 클래스 메소드는 동일하게 유지...
+
+
+def main():
+    """
+    중복 감지 프로세서 메인 함수
+    환경변수 또는 직접 값을 설정하여 필요한 정보를 구성합니다.
+    """
+    # AWS 인증 정보 설정 (환경 변수 또는 IAM 역할을 통해 자동으로 감지되기도 함)
+    # os.environ['AWS_ACCESS_KEY_ID'] = 'YOUR_ACCESS_KEY'
+    # os.environ['AWS_SECRET_ACCESS_KEY'] = 'YOUR_SECRET_KEY'
     
-    def get_most_similar_documents(self, file_path=None, text=None, document_id=None, top_k=5):
-        """
-        가장 유사한 문서 k개 찾기
-        
-        Args:
-            file_path (str, optional): 파일 경로
-            text (str, optional): 직접 비교할 텍스트
-            document_id (str, optional): 이미 저장된 문서 ID
-            top_k (int): 반환할 유사 문서 수
-            
-        Returns:
-            list: 유사 문서 목록
-        """
-        if len(self.document_ids) == 0:
-            return []
-        
-        embedding = None
-        
-        if document_id:
-            # 문서 ID로 임베딩 찾기
-            embedding_doc = self.embeddings_collection.find_one({"document_id": ObjectId(document_id)})
-            if embedding_doc:
-                embedding = np.array(embedding_doc["embedding"], dtype=np.float32)
-        
-        elif file_path:
-            # 파일에서 텍스트 추출
-            text = self._extract_text(file_path)
-            text = self._preprocess_text(text)
-            embedding = self._compute_embedding(text)
-        
-        elif text:
-            # 직접 제공된 텍스트 사용
-            text = self._preprocess_text(text)
-            embedding = self._compute_embedding(text)
-        
-        else:
-            return []
-        
-        # 벡터 정규화
-        embedding = embedding / np.linalg.norm(embedding)
-        embedding = embedding.reshape(1, -1).astype(np.float32)
-        
-        # 유사한 문서 검색
-        k = min(top_k, len(self.document_ids))
-        D, I = self.index.search(embedding, k)
-        
-        results = []
-        for i in range(k):
-            doc_id = ObjectId(self.document_ids[I[0][i]])
-            doc = self.documents_collection.find_one({"_id": doc_id})
-            
-            if doc:
-                results.append({
-                    'document_id': str(doc_id),
-                    'title': doc.get('title', 'Unknown'),
-                    'similarity': float(D[0][i]),
-                    'created_at': doc.get('created_at', None),
-                    'file_type': doc.get('file_type', None),
-                    'metadata': doc.get('metadata', {})
-                })
-        
-        return results
+    # SQS 큐 URL 설정
+    sqs_queue_url = "https://sqs.ap-northeast-2.amazonaws.com/864981757354/XRPedia-AI-Requests.fifo"
     
-    def delete_document(self, document_id):
-        """문서 및 관련 데이터 삭제"""
-        # ObjectId로 변환
-        doc_id = ObjectId(document_id)
-        
-        # 문서 존재 확인
-        doc = self.documents_collection.find_one({"_id": doc_id})
-        if not doc:
-            return {"success": False, "message": "Document not found"}
-        
-        # 해시 정보 삭제
-        self.file_hashes_collection.delete_many({"document_id": doc_id})
-        
-        # 임베딩 정보 찾기
-        embedding_doc = self.embeddings_collection.find_one({"document_id": doc_id})
-        
-        # 문서 삭제
-        self.documents_collection.delete_one({"_id": doc_id})
-        
-        # 임베딩 삭제
-        self.embeddings_collection.delete_one({"document_id": doc_id})
-        
-        # FAISS 인덱스 및 document_ids 업데이트
-        # (FAISS는 삭제를 직접 지원하지 않으므로 인덱스를 재구성)
-        if embedding_doc:
-            # 문서 ID 목록에서 제거
-            try:
-                idx = self.document_ids.index(str(doc_id))
-                self.document_ids.pop(idx)
-                
-                # 새 인덱스 구성 (모든 임베딩 재로드)
-                self._rebuild_faiss_index()
-            except ValueError:
-                pass  # document_ids에 없는 경우
-        
-        return {"success": True, "message": "Document deleted successfully"}
+    # API 엔드포인트 설정
+    api_endpoint = "/ai-proxy/file-duplicate-check-embeddings"
     
-    def _rebuild_faiss_index(self):
-        """FAISS 인덱스 재구성"""
-        # 새 인덱스 생성
-        self.index = faiss.IndexFlatIP(self.vector_dimension)
-        
-        # MongoDB에서 모든 임베딩 가져오기
-        embeddings_docs = list(self.embeddings_collection.find({}))
-        
-        if len(embeddings_docs) > 0:
-            # 문서 ID 목록 재구성
-            self.document_ids = [str(doc['document_id']) for doc in embeddings_docs]
-            
-            # 임베딩 벡터 로드하여 FAISS 인덱스에 추가
-            embeddings = np.array([doc['embedding'] for doc in embeddings_docs], dtype=np.float32)
-            if len(embeddings) > 0:
-                self.index.add(embeddings)
+    # MongoDB 연결 설정 (환경에 맞게 수정)
+    # 여기서는 직접 연결하지 않고 API를 통해 처리한다고 하셨으므로 불필요
+    mongo_uri = None
+    db_name = None
     
-    def categorize_document(self, document_id, categories):
-        """
-        문서 카테고리 지정
-        
-        Args:
-            document_id (str): 문서 ID
-            categories (list): 카테고리 목록
-            
-        Returns:
-            dict: 업데이트 결과
-        """
-        try:
-            result = self.documents_collection.update_one(
-                {"_id": ObjectId(document_id)},
-                {"$set": {"categories": categories, "updated_at": datetime.datetime.now()}}
-            )
-            return {
-                "success": result.modified_count > 0,
-                "message": "Categories updated" if result.modified_count > 0 else "No changes made"
-            }
-        except Exception as e:
-            return {"success": False, "message": str(e)}
+    # 임베딩 모델 설정
+    model_name = 'paraphrase-multilingual-MiniLM-L12-v2'  # 다국어 지원 모델
+    use_gpu = True  # GPU 사용 설정
+    similarity_threshold = 0.85  # 기본 임계값 사용
     
-    def search_documents(self, query, filter_criteria=None, limit=10):
-        """
-        문서 검색 (텍스트 기반)
+    # FIFO 큐 관련 설정
+    # FIFO 큐는 메시지 그룹 ID를 사용하여 메시지 순서를 관리합니다
+    # 필요에 따라 메시지 그룹 ID 처리 로직을 추가할 수 있습니다
+    
+    # 폴링 간격 설정 (초 단위)
+    polling_interval = 1  # 1초 간격으로 폴링
+    
+    # AWS 리전 설정
+    region_name = 'ap-northeast-2'
+    
+    print("중복 감지 프로세서 초기화 중...")
+    print(f"SQS 큐 URL: {sqs_queue_url}")
+    print(f"API 엔드포인트: {api_endpoint}")
+    print(f"GPU 사용: {use_gpu}")
+    print(f"폴링 간격: {polling_interval}초")
+    
+    try:
+        # 중복 감지 프로세서 초기화
+        processor = DuplicateDetectionProcessor(
+            model_name=model_name,
+            use_gpu=use_gpu,
+            similarity_threshold=similarity_threshold,
+            mongo_uri=mongo_uri,
+            db_name=db_name,
+            sqs_queue_url=sqs_queue_url,
+            api_endpoint=api_endpoint,
+            region_name=region_name
+        )
         
-        Args:
-            query (str): 검색어
-            filter_criteria (dict, optional): 필터 조건
-            limit (int): 최대 결과 수
-            
-        Returns:
-            list: 검색 결과
-        """
-        # 검색어 처리
-        processed_query = self._preprocess_text(query)
+        print("SQS 메시지 폴링 시작...")
+        # 폴링 루프 시작 (Ctrl+C로 중지할 때까지 실행)
+        processor.start_polling_loop(polling_interval=polling_interval)
         
-        # 임베딩 계산
-        query_embedding = self._compute_embedding(processed_query)
-        normalized_embedding = query_embedding / np.linalg.norm(query_embedding)
-        embedding_for_search = normalized_embedding.reshape(1, -1).astype(np.float32)
-        
-        # 유사한 문서 검색
-        if len(self.document_ids) == 0:
-            return []
-        
-        k = min(limit * 2, len(self.document_ids))  # 필터링 고려하여 더 많이 가져옴
-        D, I = self.index.search(embedding_for_search, k)
-        
-        # 결과 가공
-        candidate_docs = []
-        for i in range(len(I[0])):
-            doc_id = ObjectId(self.document_ids[I[0][i]])
-            
-            # 필터 조건 적용
-            query_filter = {"_id": doc_id}
-            if filter_criteria:
-                for key, value in filter_criteria.items():
-                    query_filter[key] = value
-            
-            doc = self.documents_collection.find_one(query_filter)
-            if doc:
-                candidate_docs.append({
-                    'document_id': str(doc_id),
-                    'title': doc.get('title', 'Unknown'),
-                    'similarity': float(D[0][i]),
-                    'created_at': doc.get('created_at', None),
-                    'categories': doc.get('categories', []),
-                    'metadata': doc.get('metadata', {})
-                })
-        
-        # 결과 제한
-        return candidate_docs[:limit]
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
