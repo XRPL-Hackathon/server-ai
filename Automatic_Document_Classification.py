@@ -595,16 +595,16 @@ class PDFClassifier:
 
 # 메인 함수 (AWS SQS + MongoDB 사용 예시)
 def main():
-    # MongoDB 연결
-    mongo_client = get_mongodb_connection("mongodb://localhost:27017/")
-    
-    if not mongo_client:
-        print("MongoDB 연결 실패. 프로그램을 종료합니다.")
-        return
+    # MongoDB 연결 시도 (필요 없다면 None으로 설정)
+    try:
+        mongo_client = get_mongodb_connection("mongodb://localhost:27017/")
+    except:
+        print("MongoDB 연결 없이 계속합니다.")
+        mongo_client = None
     
     # SQS 대기열 URL 및 API 엔드포인트 설정
-    sqs_queue_url = "https://sqs.ap-northeast-2.amazonaws.com/your-account-id/your-queue-name"
-    api_endpoint = "https://your-api-endpoint.com"
+    sqs_queue_url = "https://sqs.ap-northeast-2.amazonaws.com/864981757354/XRPedia-AI-Requests.fifo"
+    api_endpoint = "https://your-api-endpoint-base-url.com"  # 이 부분을 실제 API 엔드포인트 기본 URL로 수정
     
     # PDF 처리기 초기화
     processor = PDFProcessor(
@@ -614,8 +614,14 @@ def main():
         api_endpoint=api_endpoint
     )
     
+    # 폴링 간격 설정 (1초)
+    polling_interval = 1
+    
+    print(f"PDF 처리기 초기화 완료. SQS URL: {sqs_queue_url}")
+    print(f"폴링 간격: {polling_interval}초")
+    
     # SQS 폴링 루프 시작
-    processor.start_polling_loop()
+    processor.start_polling_loop(polling_interval=polling_interval)
 
 if __name__ == "__main__":
     main()
