@@ -461,6 +461,20 @@ def main():
     """
     중복 감지 프로세서 메인 함수 (MongoDB 없이 실행)
     """
+    # 환경 변수 확인 (시스템에 이미 설정되어 있다고 가정)
+    # 실행 전에 터미널/명령 프롬프트에서 환경 변수를 설정해야 함
+    if not os.environ.get('AWS_ACCESS_KEY_ID') or not os.environ.get('AWS_SECRET_ACCESS_KEY'):
+        print("경고: AWS 자격 증명이 환경 변수에 설정되어 있지 않습니다.")
+        print("AWS_ACCESS_KEY_ID와 AWS_SECRET_ACCESS_KEY를 설정하세요.")
+        print("설정 방법 (Windows CMD): set AWS_ACCESS_KEY_ID=your_key")
+        print("설정 방법 (PowerShell): $env:AWS_ACCESS_KEY_ID='your_key'")
+        print("설정 방법 (Linux/Mac): export AWS_ACCESS_KEY_ID=your_key")
+        return
+    
+    # AWS 리전 설정 (환경 변수에 없으면 기본값 사용)
+    if not os.environ.get('AWS_REGION'):
+        os.environ['AWS_REGION'] = 'ap-northeast-2'
+    
     # SQS 큐 URL 설정
     sqs_queue_url = "https://sqs.ap-northeast-2.amazonaws.com/864981757354/XRPedia-AI-Requests.fifo"
     
@@ -470,12 +484,13 @@ def main():
     # 기타 설정
     use_gpu = True  # 실제로는 사용하지 않음
     polling_interval = 1
-    region_name = 'ap-northeast-2'
+    region_name = os.environ.get('AWS_REGION', 'ap-northeast-2')
     
     print("중복 감지 프로세서 초기화 중...")
     print(f"SQS 큐 URL: {sqs_queue_url}")
     print(f"API 엔드포인트: {api_endpoint}")
     print(f"폴링 간격: {polling_interval}초")
+    print(f"AWS 리전: {region_name}")
     
     try:
         # MongoDB 없이 프로세서 초기화
