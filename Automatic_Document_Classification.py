@@ -6,13 +6,8 @@ import boto3
 import requests
 import tempfile
 from urllib.parse import urlparse
-from io import BytesIO
 from PyPDF2 import PdfReader
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.pipeline import Pipeline
-import warnings
 from pymongo import MongoClient
 import gridfs
 from bson.objectid import ObjectId
