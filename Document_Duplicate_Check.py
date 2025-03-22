@@ -1,24 +1,18 @@
 import numpy as np
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import os
 import hashlib
 from sentence_transformers import SentenceTransformer
 import torch
-from transformers import AutoTokenizer, AutoModel
 import re
 from PyPDF2 import PdfReader
 import docx
 import pytesseract
 from PIL import Image
 import mimetypes
-import joblib
 import faiss
 from pymongo import MongoClient
 from bson import ObjectId
 import datetime
-import pickle
 import boto3
 import json
 import requests
@@ -497,7 +491,7 @@ def main():
     sqs_queue_url = "https://sqs.ap-northeast-2.amazonaws.com/864981757354/XRPedia-AI-Requests.fifo"
     
     # API 엔드포인트 설정
-    api_endpoint = "/ai-proxy/file-duplicate-check-embeddings"
+    api_endpoint = "https://5erhg0u08g.execute-api.ap-northeast-2.amazonaws.com"
     
     # MongoDB 연결 설정 (환경에 맞게 수정)
     # 여기서는 직접 연결하지 않고 API를 통해 처리한다고 하셨으므로 불필요
